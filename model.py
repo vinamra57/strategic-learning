@@ -41,12 +41,13 @@ class Config:
     min_bet: float          = 10.0   # table minimum
     max_bet: float          = 500.0  # table maximum
     n_bet_levels: int       = 5      # discrete bet sizes > 0 (sit-out is extra)
+    allow_sit_out: bool     = True   # False = agent must bet every hand
 
     # ── Training ─────────────────────────────────────────────────────────────
     n_episodes: int         = 50_000 # shoes (episodes) to train on
     play_gamma: float       = 0.99   # PlayAgent discount factor
     meta_gamma: float       = 0.0    # MetaAgent discount factor (Contextual Bandit)
-    lr: float               = 1e-3   # Adam learning rate
+    lr: float               = 1e-4   # Adam learning rate (was initially 1e-3)
     batch_size: int         = 32
     replay_capacity: int    = 100_000
     target_update_freq: int = 2000   # online→target sync interval (steps)
@@ -63,7 +64,8 @@ class Config:
 
     # ── Policy Gradient (PGPlayAgent) ─────────────────────────────────────────
     agent_type: str         = "dqn"  # "dqn" or "pg"
-    pg_entropy_coef: float  = 0.01   # entropy regularisation for REINFORCE
+    pg_entropy_coef: float  = 0.05   # entropy regularisation for REINFORCE (was initially 0.01)
+    pg_use_critic: bool     = True   # False = pure REINFORCE (no value baseline)
 
     # ── Logging / checkpointing ───────────────────────────────────────────────
     log_every: int          = 1_000  # episodes between training log lines
@@ -318,15 +320,16 @@ class PGPlayAgent:
         self.n_actions = n_actions
         self.cfg = cfg
         self.gamma = gamma
+        self.use_critic = cfg.pg_use_critic
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.episodes = 0   # for logging compatibility
 
-        # Actor outputs action logits; critic outputs a scalar state value.
-        self.actor  = QNet(state_dim, n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(self.device)
-        self.critic = QNet(state_dim, 1,         cfg.hidden_dim, cfg.n_hidden_layers).to(self.device)
+        self.actor = QNet(state_dim, n_actions, cfg.hidden_dim, cfg.n_hidden_layers).to(self.device)
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=cfg.lr)
 
-        self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=cfg.lr)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=cfg.lr)
+        if self.use_critic:
+            self.critic = QNet(state_dim, 1, cfg.hidden_dim, cfg.n_hidden_layers).to(self.device)
+            self.critic_opt = optim.Adam(self.critic.parameters(), lr=cfg.lr)
 
         # Hand-level trajectory buffer: list of (state, action, reward, done)
         self._traj: list[tuple] = []
@@ -392,17 +395,20 @@ class PGPlayAgent:
             returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
 
         # ── critic (value baseline) update ────────────────────────────────────
-        values = self.critic(states).squeeze(1)
-        critic_loss = nn.functional.mse_loss(values, returns_t.detach())
-        self.critic_opt.zero_grad()
-        critic_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_opt.step()
+        if self.use_critic:
+            values = self.critic(states).squeeze(1)
+            critic_loss = nn.functional.mse_loss(values, returns_t.detach())
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+            self.critic_opt.step()
 
-        # ── actor (policy) update via REINFORCE ───────────────────────────────
-        with torch.no_grad():
-            baseline = self.critic(states).squeeze(1)
-        advantage = returns_t - baseline
+            with torch.no_grad():
+                baseline = self.critic(states).squeeze(1)
+            advantage = returns_t - baseline
+        else:
+            # Pure REINFORCE: normalized returns are already ~zero-mean, no baseline
+            advantage = returns_t
 
         logits     = self.actor(states)
         log_probs  = torch.log_softmax(logits, dim=-1)
@@ -422,21 +428,24 @@ class PGPlayAgent:
     # ── persistence ──────────────────────────────────────────────────────────
 
     def save(self, path: str | Path):
-        torch.save({
-            "actor":      self.actor.state_dict(),
-            "critic":     self.critic.state_dict(),
-            "actor_opt":  self.actor_opt.state_dict(),
-            "critic_opt": self.critic_opt.state_dict(),
-            "steps":      self.steps,
-        }, path)
+        d = {
+            "actor":     self.actor.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "steps":     self.steps,
+        }
+        if self.use_critic:
+            d["critic"]     = self.critic.state_dict()
+            d["critic_opt"] = self.critic_opt.state_dict()
+        torch.save(d, path)
 
     def load(self, path: str | Path):
         ckpt = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(ckpt["actor"])
-        self.critic.load_state_dict(ckpt["critic"])
         self.actor_opt.load_state_dict(ckpt["actor_opt"])
-        self.critic_opt.load_state_dict(ckpt["critic_opt"])
         self.steps = ckpt["steps"]
+        if self.use_critic and "critic" in ckpt:
+            self.critic.load_state_dict(ckpt["critic"])
+            self.critic_opt.load_state_dict(ckpt["critic_opt"])
 
 
 def get_remaining_ratios(shoe) -> np.ndarray:
@@ -533,13 +542,15 @@ def run_episode(
         ms = encode_meta(shoe, balance, cfg)
         meta_action = meta_agent.act(ms, greedy=greedy)
 
-        if meta_action == 0:
+        if cfg.allow_sit_out and meta_action == 0:
             bet = 0.0
-        else:
+        elif cfg.allow_sit_out:
             bet = bet_levels[meta_action - 1]
-            
+        else:
+            bet = bet_levels[meta_action]
+
         # ── Deal a hand ───────────────────────────────────────────────────────
-        is_sitting_out = (bet == 0.0)
+        is_sitting_out = cfg.allow_sit_out and (meta_action == 0)
         virtual_bet = cfg.min_bet if is_sitting_out else bet
         
         obs, info = env.reset(bet=virtual_bet)
@@ -627,13 +638,15 @@ def evaluate(
             hands += 1
             ms = encode_meta(shoe, balance, cfg)
             meta_action = meta_agent.act(ms, greedy=True)
-            if meta_action == 0:
+            if cfg.allow_sit_out and meta_action == 0:
                 sit_outs += 1
                 bet = 0.0
-            else:
+            elif cfg.allow_sit_out:
                 bet = bet_levels[meta_action - 1]
-                
-            is_sitting_out = (bet == 0.0)
+            else:
+                bet = bet_levels[meta_action]
+
+            is_sitting_out = cfg.allow_sit_out and (meta_action == 0)
             virtual_bet = cfg.min_bet if is_sitting_out else bet
             
             obs, info = env.reset(bet=virtual_bet)
@@ -680,10 +693,15 @@ def train(
     meta_agent: "BanditAgent | None" = None,
 ) -> tuple["DQNAgent | PGPlayAgent", "BanditAgent"]:
     bet_levels     = build_bet_levels(cfg.min_bet, cfg.max_bet, cfg.n_bet_levels)
-    n_meta_actions = len(bet_levels) + 1
+    n_meta_actions = len(bet_levels) + (1 if cfg.allow_sit_out else 0)
 
-    print(f"Play agent          : {cfg.agent_type.upper()}")
-    print(f"Bet levels          : {bet_levels} (plus $0.0 for Sit Out)")
+    pg_mode = f"{cfg.agent_type.upper()}" + (
+        " + critic" if cfg.agent_type == "pg" and cfg.pg_use_critic else
+        " (no critic)" if cfg.agent_type == "pg" else ""
+    )
+    print(f"Play agent          : {pg_mode}")
+    sit_label = " (plus $0.0 for Sit Out)" if cfg.allow_sit_out else " (sit-out disabled)"
+    print(f"Bet levels          : {bet_levels}{sit_label}")
     print(f"Meta actions        : {n_meta_actions}")
     print(f"Device              : {'cuda' if torch.cuda.is_available() else 'cpu'}")
     print()
@@ -771,6 +789,8 @@ def _build_parser() -> argparse.ArgumentParser:
     env.add_argument("--min-bet",          type=float, default=d.min_bet)
     env.add_argument("--max-bet",          type=float, default=d.max_bet)
     env.add_argument("--n-bet-levels",     type=int,   default=d.n_bet_levels)
+    env.add_argument("--no-sit-out",       dest="allow_sit_out", action="store_false",
+                     help="Force agent to bet every hand (no sit-out action)")
 
     tr = p.add_argument_group("training")
     tr.add_argument("--n-episodes",         type=int,   default=d.n_episodes)
@@ -796,6 +816,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     choices=["dqn", "pg"],
                     help="Play agent algorithm: dqn (Double DQN) or pg (REINFORCE+baseline)")
     pg.add_argument("--pg-entropy-coef",    type=float, default=d.pg_entropy_coef)
+    pg.add_argument("--no-critic",          dest="pg_use_critic", action="store_false",
+                    help="Pure REINFORCE: disable value-function baseline")
 
     lg = p.add_argument_group("logging")
     lg.add_argument("--log-every",          type=int,   default=d.log_every)
@@ -816,6 +838,7 @@ if __name__ == "__main__":
         min_bet                 = args.min_bet,
         max_bet                 = args.max_bet,
         n_bet_levels            = args.n_bet_levels,
+        allow_sit_out           = args.allow_sit_out,
         n_episodes              = args.n_episodes,
         play_gamma              = args.play_gamma,
         meta_gamma              = args.meta_gamma,
@@ -831,6 +854,7 @@ if __name__ == "__main__":
         n_hidden_layers         = args.n_hidden_layers,
         agent_type              = args.agent_type,
         pg_entropy_coef         = args.pg_entropy_coef,
+        pg_use_critic           = args.pg_use_critic,
         log_every               = args.log_every,
         eval_every              = args.eval_every,
         eval_episodes           = args.eval_episodes,

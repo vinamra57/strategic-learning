@@ -74,8 +74,6 @@ class Shoe:
         self._cut = int(len(self.cards) * self.penetration)
 
     def deal(self) -> str:
-        if self.needs_reshuffle():
-            self._build()
         card = self.cards.pop()
         self.running_count += HI_LO_COUNT[card]
         self.cards_dealt += 1
