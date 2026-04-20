@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from sim import BlackjackEnv, Action
+from llm_advisor import BaseAdvisor, NullAdvisor, LLMAdvisor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -42,12 +43,14 @@ class Config:
     max_bet: float          = 500.0  # table maximum
     n_bet_levels: int       = 5      # discrete bet sizes > 0 (sit-out is extra)
     allow_sit_out: bool     = True   # False = agent must bet every hand
+    use_llm: bool           = False  # True = append LLM features to state (state_dim 13→16)
+    llm_call_every: int     = 10     # call LLM every N hands, reuse features in between
 
     # ── Training ─────────────────────────────────────────────────────────────
     n_episodes: int         = 50_000 # shoes (episodes) to train on
     play_gamma: float       = 0.99   # PlayAgent discount factor
     meta_gamma: float       = 0.0    # MetaAgent discount factor (Contextual Bandit)
-    lr: float               = 1e-4   # Adam learning rate (was initially 1e-3)
+    lr: float               = 5e-4   # Adam learning rate (was initially 1e-3)
     batch_size: int         = 32
     replay_capacity: int    = 100_000
     target_update_freq: int = 2000   # online→target sync interval (steps)
@@ -523,6 +526,7 @@ def run_episode(
     cfg: Config,
     greedy: bool = False,
     learn: bool = True,
+    advisor: "BaseAdvisor | None" = None,
 ) -> float:
     """Play one shoe. Returns total_profit.
 
@@ -535,11 +539,24 @@ def run_episode(
     balance = cfg.starting_balance
     shoe = env.shoe
     shoe._build()
+    _advisor = advisor or NullAdvisor()
+    _llm_feats: np.ndarray | None = None
+    _hand_count = 0
 
     while not shoe.needs_reshuffle():
 
+        # ── LLM features (called every llm_call_every hands) ─────────────────
+        if cfg.use_llm:
+            if _hand_count % cfg.llm_call_every == 0:
+                _llm_feats = _advisor.features(shoe)
+            llm_feats = _llm_feats
+        else:
+            llm_feats = None
+        _hand_count += 1
+
         # ── MetaAgent: bet sizing ────────────────────────────────────────────
-        ms = encode_meta(shoe, balance, cfg)
+        ms_base = encode_meta(shoe, balance, cfg)
+        ms = np.concatenate([ms_base, llm_feats]) if llm_feats is not None else ms_base
         meta_action = meta_agent.act(ms, greedy=greedy)
 
         if cfg.allow_sit_out and meta_action == 0:
@@ -574,21 +591,21 @@ def run_episode(
             continue
 
         # ── PlayAgent: in-hand decisions ──────────────────────────────────────
-        ps = encode_play(obs, shoe)
+        ps_base = encode_play(obs, shoe)
+        ps = np.concatenate([ps_base, llm_feats]) if llm_feats is not None else ps_base
         terminated = False
         hand_reward = 0.0
 
         while not terminated:
             legal = [int(a) for a in env.legal_actions()]
             play_action = play_agent.act(ps, legal_mask=legal, greedy=greedy)
-            
-            # Use raw enum for env action
+
             action_enum = Action(play_action)
             obs, raw_r, terminated, _, info = env.step(action_enum)
 
-            # Normalise play reward purely by virtual bet for stability → {-2,-1,0,+1,+1.5,+2}
             play_reward = raw_r / virtual_bet
-            next_ps = encode_play(obs, shoe)
+            next_ps_base = encode_play(obs, shoe)
+            next_ps = np.concatenate([next_ps_base, llm_feats]) if llm_feats is not None else next_ps_base
 
             if learn:
                 play_agent.store(ps, play_action, play_reward, next_ps, terminated)
@@ -620,23 +637,36 @@ def evaluate(
     meta_agent: BanditAgent,
     bet_levels: list[float],
     cfg: Config,
+    advisor: "BaseAdvisor | None" = None,
 ) -> dict:
     env = BlackjackEnv(cfg.num_decks, cfg.penetration)
+    _advisor = advisor or NullAdvisor()
     profits = []
     
     # We will also calculate sit_out rate: proportion of hands where bet=0.
     # To do this cleanly, we just log meta agent actions.
     sit_outs = 0
     hands = 0
+    hands_won = 0
     
     for _ in range(cfg.eval_episodes):
         shoe = env.shoe
         shoe._build()
         balance = 0.0
         
+        _llm_feats_eval: np.ndarray | None = None
+        _hand_count_eval = 0
         while not shoe.needs_reshuffle():
             hands += 1
-            ms = encode_meta(shoe, balance, cfg)
+            if cfg.use_llm:
+                if _hand_count_eval % cfg.llm_call_every == 0:
+                    _llm_feats_eval = _advisor.features(shoe)
+                llm_feats = _llm_feats_eval
+            else:
+                llm_feats = None
+            _hand_count_eval += 1
+            ms_base = encode_meta(shoe, balance, cfg)
+            ms = np.concatenate([ms_base, llm_feats]) if llm_feats is not None else ms_base
             meta_action = meta_agent.act(ms, greedy=True)
             if cfg.allow_sit_out and meta_action == 0:
                 sit_outs += 1
@@ -653,21 +683,29 @@ def evaluate(
                 
             if info["dealer_blackjack"]:
                 real_reward = 0.0 if is_sitting_out else env._dealer_play()
+                if real_reward > 0:
+                    hands_won += 1
                 balance += real_reward
                 continue
             if info["player_hand"].is_blackjack:
                 real_reward = 0.0 if is_sitting_out else env._dealer_play()
+                if real_reward > 0:
+                    hands_won += 1
                 balance += real_reward
                 continue
                 
-            ps = encode_play(obs, shoe)
+            ps_base = encode_play(obs, shoe)
+            ps = np.concatenate([ps_base, llm_feats]) if llm_feats is not None else ps_base
             terminated = False
             while not terminated:
                 legal = [int(a) for a in env.legal_actions()]
                 play_action = play_agent.act(ps, legal_mask=legal, greedy=True)
                 obs, raw_r, terminated, _, info = env.step(Action(play_action))
-                ps = encode_play(obs, shoe)
+                ps_base = encode_play(obs, shoe)
+                ps = np.concatenate([ps_base, llm_feats]) if llm_feats is not None else ps_base
             real_reward = 0.0 if is_sitting_out else raw_r
+            if real_reward > 0:
+                hands_won += 1
             balance += real_reward
             
         profits.append(balance)
@@ -681,6 +719,7 @@ def evaluate(
         "min":           float(arr.min()),
         "max":           float(arr.max()),
         "sit_out_rate":  float(sit_outs / hands) if hands > 0 else 0.0,
+        "hand_win_rate": float(hands_won / (hands - sit_outs)) if (hands - sit_outs) > 0 else 0.0,
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -691,6 +730,7 @@ def train(
     cfg: Config,
     play_agent: "DQNAgent | PGPlayAgent | None" = None,
     meta_agent: "BanditAgent | None" = None,
+    advisor: "BaseAdvisor | None" = None,
 ) -> tuple["DQNAgent | PGPlayAgent", "BanditAgent"]:
     bet_levels     = build_bet_levels(cfg.min_bet, cfg.max_bet, cfg.n_bet_levels)
     n_meta_actions = len(bet_levels) + (1 if cfg.allow_sit_out else 0)
@@ -704,16 +744,19 @@ def train(
     print(f"Bet levels          : {bet_levels}{sit_label}")
     print(f"Meta actions        : {n_meta_actions}")
     print(f"Device              : {'cuda' if torch.cuda.is_available() else 'cpu'}")
+    print(f"LLM advisor         : {'Qwen (state_dim=16)' if cfg.use_llm else 'disabled (state_dim=13)'}")
     print()
+
+    _advisor = advisor or (LLMAdvisor() if cfg.use_llm else NullAdvisor())
+    state_dim = 13 + (_advisor.FEATURE_DIM if cfg.use_llm else 0)
 
     if play_agent is None:
         if cfg.agent_type == "pg":
-            play_agent = PGPlayAgent(state_dim=13, n_actions=3, cfg=cfg, gamma=cfg.play_gamma)
+            play_agent = PGPlayAgent(state_dim=state_dim, n_actions=3, cfg=cfg, gamma=cfg.play_gamma)
         else:
-            play_agent = DQNAgent(state_dim=13, n_actions=3, cfg=cfg, gamma=cfg.play_gamma)
-    # MetaAgent (Bandit): state 10D ratios + (decks_remaining, cards_dealt, balance) = 13
+            play_agent = DQNAgent(state_dim=state_dim, n_actions=3, cfg=cfg, gamma=cfg.play_gamma)
     if meta_agent is None:
-        meta_agent = BanditAgent(state_dim=13, n_actions=n_meta_actions, cfg=cfg)
+        meta_agent = BanditAgent(state_dim=state_dim, n_actions=n_meta_actions, cfg=cfg)
 
     env = BlackjackEnv(cfg.num_decks, cfg.penetration)
 
@@ -723,7 +766,7 @@ def train(
     eval_log:  list[dict] = []
 
     for ep in range(1, cfg.n_episodes + 1):
-        profit = run_episode(env, play_agent, meta_agent, bet_levels, cfg)
+        profit = run_episode(env, play_agent, meta_agent, bet_levels, cfg, advisor=_advisor)
         profit_window.append(profit)
 
         # Tick episode counters for epsilon decay
@@ -750,14 +793,14 @@ def train(
             )
 
         if ep % cfg.eval_every == 0:
-            stats = evaluate(play_agent, meta_agent, bet_levels, cfg)
+            stats = evaluate(play_agent, meta_agent, bet_levels, cfg, advisor=_advisor)
             stats["episode"] = ep
             eval_log.append(stats)
             print(
                 f"  ┌─ EVAL ({cfg.eval_episodes} shoes, greedy) ─"
                 f"\n  │  mean={stats['mean']:>+8.2f}  std={stats['std']:.2f}"
                 f"\n  │  median={stats['median']:>+7.2f}  win_rate={stats['win_rate']:.1%}"
-                f"\n  │  sit_out_rate={stats['sit_out_rate']:.1%}"
+                f"\n  │  sit_out_rate={stats['sit_out_rate']:.1%}  hand_win_rate={stats['hand_win_rate']:.1%}"
                 f"\n  └─ range [{stats['min']:+.2f}, {stats['max']:+.2f}]"
             )
 
@@ -791,6 +834,10 @@ def _build_parser() -> argparse.ArgumentParser:
     env.add_argument("--n-bet-levels",     type=int,   default=d.n_bet_levels)
     env.add_argument("--no-sit-out",       dest="allow_sit_out", action="store_false",
                      help="Force agent to bet every hand (no sit-out action)")
+    env.add_argument("--use-llm",          dest="use_llm", action="store_true",
+                     help="Append Qwen LLM card-count features to state (requires ollama serve)")
+    env.add_argument("--llm-call-every",   type=int, default=Config().llm_call_every,
+                     help="Call LLM every N hands, reuse features in between")
 
     tr = p.add_argument_group("training")
     tr.add_argument("--n-episodes",         type=int,   default=d.n_episodes)
@@ -839,6 +886,8 @@ if __name__ == "__main__":
         max_bet                 = args.max_bet,
         n_bet_levels            = args.n_bet_levels,
         allow_sit_out           = args.allow_sit_out,
+        use_llm                 = args.use_llm,
+        llm_call_every          = args.llm_call_every,
         n_episodes              = args.n_episodes,
         play_gamma              = args.play_gamma,
         meta_gamma              = args.meta_gamma,
