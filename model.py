@@ -25,9 +25,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from sim import BlackjackEnv, Action
-from llm_advisor import BaseAdvisor, NullAdvisor, LLMAdvisor
+from llm_advisor import BaseAdvisor, NullAdvisor, LLMAdvisor, TableAdvisor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -784,6 +787,8 @@ def train(
                 "episode":       ep,
                 "mean_profit":   avg,
                 "std_profit":    std,
+                "play_loss":     p_loss,
+                "meta_loss":     m_loss,
             })
 
             print(
@@ -811,7 +816,47 @@ def train(
         meta_agent.save(p / "meta_agent.pt")
         print(f"\nCheckpoints saved → {p}/")
 
+    _plot_training(train_log, eval_log, cfg.plot_path)
     return play_agent, meta_agent
+
+
+def _plot_training(train_log: list[dict], eval_log: list[dict], path: str):
+    if not train_log and not eval_log:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=False)
+
+    # ── top: mean profit (training window) ───────────────────────────────────
+    ax = axes[0]
+    if train_log:
+        eps   = [d["episode"]     for d in train_log]
+        prof  = [d["mean_profit"] for d in train_log]
+        ax.plot(eps, prof, color="steelblue", linewidth=1.2, label="mean profit (train window)")
+        ax.axhline(0, color="gray", linewidth=0.7, linestyle="--")
+    ax.set_ylabel("Mean profit per shoe")
+    ax.set_xlabel("Episode")
+    ax.set_title("Training profit")
+    ax.legend(fontsize=8)
+
+    # ── bottom: hand win rate (eval) ─────────────────────────────────────────
+    ax = axes[1]
+    if eval_log:
+        eps_e = [d["episode"]      for d in eval_log]
+        hwr   = [d["hand_win_rate"] for d in eval_log]
+        ax.plot(eps_e, hwr, color="darkorange", linewidth=1.4, marker="o",
+                markersize=4, label="hand win rate (eval, greedy)")
+        ax.axhline(0.42, color="gray", linewidth=0.7, linestyle="--",
+                   label="~42% baseline (optimal basic strategy)")
+        ax.set_ylim(0, 1)
+    ax.set_ylabel("Hand win rate")
+    ax.set_xlabel("Episode")
+    ax.set_title("Hand win rate (greedy eval)")
+    ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    print(f"\nPlot saved → {path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -835,7 +880,9 @@ def _build_parser() -> argparse.ArgumentParser:
     env.add_argument("--no-sit-out",       dest="allow_sit_out", action="store_false",
                      help="Force agent to bet every hand (no sit-out action)")
     env.add_argument("--use-llm",          dest="use_llm", action="store_true",
-                     help="Append Qwen LLM card-count features to state (requires ollama serve)")
+                     help="Append LLM card-count features to state")
+    env.add_argument("--llm-table",        type=str,   default=None,
+                     help="Path to precomputed llm_table.json (implies --use-llm, no Ollama needed)")
     env.add_argument("--llm-call-every",   type=int, default=Config().llm_call_every,
                      help="Call LLM every N hands, reuse features in between")
 
@@ -886,7 +933,7 @@ if __name__ == "__main__":
         max_bet                 = args.max_bet,
         n_bet_levels            = args.n_bet_levels,
         allow_sit_out           = args.allow_sit_out,
-        use_llm                 = args.use_llm,
+        use_llm                 = args.use_llm or args.llm_table is not None,
         llm_call_every          = args.llm_call_every,
         n_episodes              = args.n_episodes,
         play_gamma              = args.play_gamma,
@@ -911,4 +958,10 @@ if __name__ == "__main__":
         plot_path               = args.plot_path,
     )
     
-    train(cfg)
+    advisor = None
+    if args.llm_table is not None:
+        advisor = TableAdvisor(path=args.llm_table)
+    elif args.use_llm:
+        advisor = LLMAdvisor()
+
+    train(cfg, advisor=advisor)

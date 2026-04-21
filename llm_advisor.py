@@ -24,6 +24,7 @@ import json
 import urllib.request
 import urllib.error
 import numpy as np
+import os
 
 from sim import Shoe
 
@@ -224,6 +225,65 @@ class LLMAdvisor(BaseAdvisor):
 
         self._cache[key] = result
         return result.copy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Table advisor  (fast lookup from precomputed JSON)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TableAdvisor(BaseAdvisor):
+    """
+    Loads a precomputed lookup table (produced by precompute.py) and serves
+    features with zero network overhead.
+
+    Lookup strategy:
+      1. Exact match on rounded cache key (same rounding as LLMAdvisor).
+      2. Nearest-neighbour (L2 over the 11-tuple) if exact key missing.
+      3. Falls back to zeros if table is empty.
+
+    Args:
+        path: path to llm_table.json
+    """
+
+    def __init__(self, path: str = "llm_table.json"):
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"LLM table not found at '{path}'. "
+                "Run precompute.py first to generate it."
+            )
+        with open(path) as f:
+            raw = json.load(f)
+
+        # keys are stored as JSON-serialised tuples → convert back
+        self._table: dict[tuple, np.ndarray] = {
+            tuple(json.loads(k)): np.array(v, dtype=np.float32)
+            for k, v in raw.items()
+        }
+
+        # pre-build a matrix for fast nearest-neighbour search
+        self._keys = np.array(list(self._table.keys()), dtype=np.float32)   # (N, 11)
+        self._vals = np.stack(list(self._table.values()))                    # (N, 3)
+        print(f"[TableAdvisor] loaded {len(self._table)} entries from '{path}'")
+
+    # ── internal ─────────────────────────────────────────────────────────────
+
+    def _nearest(self, key: tuple) -> np.ndarray:
+        q = np.array(key, dtype=np.float32)
+        dists = np.sum((self._keys - q) ** 2, axis=1)
+        return self._vals[np.argmin(dists)].copy()
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    # reuse LLMAdvisor's cache-key logic without inheriting the full class
+    _cache_key = LLMAdvisor._cache_key
+
+    def features(self, shoe: Shoe) -> np.ndarray:
+        if not self._table:
+            return np.zeros(self.FEATURE_DIM, dtype=np.float32)
+        key = self._cache_key(shoe)
+        if key in self._table:
+            return self._table[key].copy()
+        return self._nearest(key)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
