@@ -353,11 +353,11 @@ def build_pack_user_prompt(
         f" sequential calls, but emit ONE pick per call. Cards you don't"
         f" pick are discarded when the pack closes.",
         "",
-        f"Ante {ctx.ante} / Money ${ctx.money} / "
-        f"Joker slots: {ctx.joker_slots_used}/{ctx.joker_slots_max} "
-        f"({ctx.joker_slots_free} free) / "
-        f"Consumable slots: {ctx.consumable_slots_used}/"
-        f"{ctx.consumable_slots_max} ({ctx.consumable_slots_free} free)",
+        f"Ante {ctx.ante} / Money ${ctx.money}",
+        f"Joker slots: {ctx.joker_slots_used} occupied, "
+        f"{ctx.joker_slots_max} max, {ctx.joker_slots_free} free",
+        f"Consumable slots: {ctx.consumable_slots_used} occupied, "
+        f"{ctx.consumable_slots_max} max, {ctx.consumable_slots_free} free",
         "",
         "Owned jokers:",
         _fmt_jokers(ctx),
