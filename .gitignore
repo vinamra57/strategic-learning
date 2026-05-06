@@ -18,3 +18,20 @@ env/
 
 # Claude config
 .claude/
+
+# Logs (per-game JSONL, bench output, run summaries)
+logs/
+balatro/logs/
+
+# Local checkpoints saved during training runs
+checkpoints/
+balatro/checkpoints/
+scores.json
+training_curve.png
+
+# Local bench / mock-RPC scaffolding (not shipped)
+balatro/tests/
+
+# Misc local scratch
+.DS_Store
+*.tmp
